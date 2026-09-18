@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender MCP Server",
     "author": "Blender MCP",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > MCP",
     "description": "TCP server cho phép MCP client điều khiển Blender",
@@ -71,6 +71,15 @@ class BlenderMCPServer:
                 break
             print(f"[Blender MCP] Client connected: {addr}")
             with self.client_lock:
+                if self.client is not None:
+                    try:
+                        client.sendall(
+                            (json.dumps({"id": None, "status": "error", "error": "Another client is already connected"}) + "\n").encode("utf-8")
+                        )
+                    except OSError:
+                        pass
+                    client.close()
+                    continue
                 self.client = client
             client.settimeout(0.5)
             buf = b""
@@ -110,7 +119,7 @@ class BlenderMCPServer:
         if ctype == "execute_code":
             self.cmd_queue.put((cid, cmd.get("code", ""), client))
         elif ctype == "quit":
-            self.running = False
+            self.stop()
         else:
             try:
                 client.sendall(
@@ -140,9 +149,19 @@ class BlenderMCPServer:
         try:
             sys.stdout, sys.stderr = stdout_capture, stderr_capture
             exec(compile(code, "<blender_mcp>", "exec"), {"bpy": bpy, "C": bpy.context, "D": bpy.data, "json": json, "math": math})
-            return {"status": "success", "output": stdout_capture.getvalue(), "stderr": stderr_capture.getvalue()}
+            return {
+                "status": "success",
+                "output": stdout_capture.getvalue(),
+                "stderr": stderr_capture.getvalue(),
+                "addon_version": ".".join(str(p) for p in bl_info["version"]),
+            }
         except Exception:
-            return {"status": "error", "error": traceback.format_exc(), "output": stdout_capture.getvalue()}
+            return {
+                "status": "error",
+                "error": traceback.format_exc(),
+                "output": stdout_capture.getvalue(),
+                "addon_version": ".".join(str(p) for p in bl_info["version"]),
+            }
         finally:
             sys.stdout, sys.stderr = old_stdout, old_stderr
 

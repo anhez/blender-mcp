@@ -7,7 +7,10 @@ Chạy: python server.py
 """
 import json
 import os
+import platform
+import re
 import socket
+import subprocess
 import urllib.parse
 import urllib.request
 
@@ -15,6 +18,29 @@ from mcp.server.fastmcp import FastMCP
 
 HOST = os.environ.get("BLENDER_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BLENDER_MCP_PORT", "9877"))
+SERVER_VERSION = "1.2.0"
+
+
+def _to_blender_path(path: str) -> str:
+    """Chuyển path phía server (WSL/Linux) sang path mà Blender (Windows) đọc được.
+
+    - /mnt/c/... -> C:/...
+    - /home/...   -> \\\\wsl$\\<distro>\\... (qua wslpath)
+    Server chạy trên Windows thì giữ nguyên.
+    """
+    if platform.system() != "Linux":
+        return path
+    if path.startswith("/mnt/"):
+        return path[5] + ":" + path[6:]
+    try:
+        out = subprocess.run(
+            ["wslpath", "-w", path], capture_output=True, text=True, timeout=10
+        )
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except Exception:
+        pass
+    return path
 
 mcp = FastMCP(
     "maket-blender",
@@ -53,7 +79,18 @@ def send_command(cmd: dict, timeout: float = 60.0) -> dict:
 def execute(code: str, timeout: float = 60.0) -> dict:
     resp = send_command({"type": "execute_code", "code": code, "id": 0}, timeout=timeout)
     if resp.get("status") == "error":
-        raise RuntimeError(resp.get("error", "Unknown Blender error"))
+        err = resp.get("error", "Unknown Blender error")
+        m = re.search(r"KeyError: ('[^']*'|\"[^\"]*\")", err)
+        if m:
+            inner = m.group(1).strip("'\"")
+            m2 = re.search(r'key "([^"]+)"', inner)
+            name = m2.group(1) if m2 else inner
+            raise RuntimeError(
+                f"Không tìm thấy '{name}' trong Blender (object, material, collection...). "
+                "Kiểm tra lại tên bằng get_scene_info."
+            )
+        last = err.strip().splitlines()[-1] if err.strip() else ""
+        raise RuntimeError(f"Lỗi trong Blender: {last}")
     return resp
 
 
@@ -82,12 +119,15 @@ def _py(value) -> str:
 
 @mcp.tool()
 def ping() -> dict:
-    """Kiểm tra kết nối tới Blender, trả về phiên bản Blender."""
+    """Kiểm tra kết nối tới Blender, trả về phiên bản Blender/addon/server."""
     resp = execute(
         "import bpy; print(json.dumps({'blender_version': bpy.app.version_string, 'scene': bpy.context.scene.name}))",
         timeout=15,
     )
-    return json.loads(resp["output"])
+    result = json.loads(resp["output"])
+    result["addon_version"] = resp.get("addon_version")
+    result["server_version"] = SERVER_VERSION
+    return result
 
 
 @mcp.tool()
@@ -293,7 +333,7 @@ s.render.resolution_y = %s
 bpy.ops.render.render(write_still=True)
 print(s.render.filepath)
 """ % (
-        _js(filepath),
+        _js(_to_blender_path(filepath)),
         resolution_x,
         resolution_y,
     )
@@ -311,7 +351,7 @@ def save_blend(filepath: str) -> str:
     code = """
 bpy.ops.wm.save_as_mainfile(filepath=%s)
 print("saved")
-""" % _js(filepath)
+""" % _js(_to_blender_path(filepath))
     execute(code)
     return f"Đã lưu '{filepath}'"
 
@@ -613,7 +653,7 @@ else:
 print(json.dumps({"material": mat.name, "image": img.name, "map_type": map_type}))
 """ % (
         _js(object_name),
-        _js(image_path),
+        _js(_to_blender_path(image_path)),
         _js(material_name),
         bool(material_name),
         _js(map_type),
@@ -683,7 +723,7 @@ finally:
     _sys.stdout = _outer
 new = [o.name for o in D.objects if o.name not in before]
 print(json.dumps({"filepath": fp, "imported": new}))
-""" % _js(filepath)
+""" % _js(_to_blender_path(filepath))
     return json.loads(execute(code, timeout=300)["output"])
 
 
@@ -721,7 +761,7 @@ finally:
     _sys.stdout = _outer
 print(fp)
 """ % (
-        _js(filepath),
+        _js(_to_blender_path(filepath)),
         _py(list(object_names) if object_names else None),
     )
     return execute(code, timeout=300)["output"].strip()
@@ -780,7 +820,7 @@ s.render.resolution_y = %s
 bpy.ops.render.render(write_still=True, use_viewport=True)
 print(s.render.filepath)
 """ % (
-        _js(filepath),
+        _js(_to_blender_path(filepath)),
         resolution_x,
         resolution_y,
     )
@@ -858,7 +898,7 @@ bg.inputs["Strength"].default_value = %s
 nt.links.new(env.outputs["Color"], bg.inputs["Color"])
 nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
 print("ok")
-""" % (_js(image_path), strength)
+""" % (_js(_to_blender_path(image_path)), strength)
     execute(code)
     return f"Đã đặt world HDRI '{image_path}'"
 
@@ -1117,8 +1157,194 @@ print(mat.name)
     return f"Đã gán material '{execute(code)['output'].strip()}'"
 
 
+@mcp.tool()
+def boolean_objects(object_a: str, object_b: str, operation: str = "DIFFERENCE", keep_b: bool = False) -> str:
+    """Thực hiện boolean giữa hai object, kết quả áp lên object_a.
+
+    Args:
+        object_a: Tên object giữ kết quả.
+        object_b: Tên object dùng làm công cụ.
+        operation: DIFFERENCE, UNION hoặc INTERSECT.
+        keep_b: Giữ lại object_b (mặc định xóa).
+    """
+    code = """
+a = D.objects[%s]
+b = D.objects[%s]
+op = %s.upper()
+if op not in ("DIFFERENCE", "UNION", "INTERSECT"):
+    raise ValueError("operation phai la DIFFERENCE, UNION hoac INTERSECT")
+C.view_layer.objects.active = a
+mod = a.modifiers.new("MCP Boolean", "BOOLEAN")
+mod.operation = op
+mod.object = b
+bpy.ops.object.modifier_apply(modifier=mod.name)
+if not %s:
+    D.objects.remove(b, do_unlink=True)
+print("boolean " + op + " ok")
+""" % (_js(object_a), _js(object_b), _js(operation), bool(keep_b))
+    execute(code)
+    return f"Boolean {operation.upper()} '{object_b}' vào '{object_a}'"
+
+
+@mcp.tool()
+def apply_transform(
+    object_name: str,
+    location: bool = True,
+    rotation: bool = True,
+    scale: bool = True,
+) -> str:
+    """Áp dụng (apply) location/rotation/scale của object về zero (giữ hình dạng hiện tại).
+
+    Args:
+        object_name: Tên object.
+        location: Apply vị trí.
+        rotation: Apply xoay.
+        scale: Apply tỷ lệ.
+    """
+    code = """
+o = D.objects[%s]
+C.view_layer.objects.active = o
+bpy.ops.object.select_all(action="DESELECT")
+o.select_set(True)
+bpy.ops.object.transform_apply(location=%s, rotation=%s, scale=%s)
+print("applied")
+""" % (_js(object_name), bool(location), bool(rotation), bool(scale))
+    execute(code)
+    return f"Đã apply transform cho '{object_name}'"
+
+
+@mcp.tool()
+def set_visibility(object_name: str, visible: bool = True, render_visible: bool | None = None) -> str:
+    """Ẩn/hiện object trong viewport và render.
+
+    Args:
+        object_name: Tên object.
+        visible: Hiện trong viewport (False = ẩn).
+        render_visible: Hiện khi render (mặc định = visible).
+    """
+    code = """
+o = D.objects[%s]
+o.hide_viewport = not %s
+rv = %s if %s is not None else %s
+o.hide_render = not rv
+print("ok")
+""" % (_js(object_name), bool(visible), _py(render_visible), _py(render_visible), bool(visible))
+    execute(code)
+    state = "hiện" if visible else "ẩn"
+    return f"Đã {state} '{object_name}' (viewport={visible}, render={render_visible if render_visible is not None else visible})"
+
+
+@mcp.tool()
+def set_world_color(color: list = (0.05, 0.05, 0.06), strength: float = 1.0) -> str:
+    """Đặt màu nền thế giới (world background) đơn giản, không cần HDRI.
+
+    Args:
+        color: Màu RGB 0.0-1.0.
+        strength: Cường độ (độ sáng) nền.
+    """
+    code = """
+world = C.scene.world
+if world is None:
+    world = D.worlds.new("World MCP")
+    C.scene.world = world
+world.use_nodes = True
+nt = world.node_tree
+nt.nodes.clear()
+bg = nt.nodes.new("ShaderNodeBackground")
+out = nt.nodes.new("ShaderNodeOutputWorld")
+bg.inputs["Color"].default_value = (*%s, 1.0)
+bg.inputs["Strength"].default_value = %s
+nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
+print("ok")
+""" % (_py(list(color)), strength)
+    execute(code)
+    return f"Đã đặt world color {list(color)} (strength={strength})"
+
+
+@mcp.tool()
+def set_frame_range(start: int, end: int) -> str:
+    """Đặt khung frame bắt đầu/kết thúc cho scene (dùng cho animation/render).
+
+    Args:
+        start: Frame bắt đầu.
+        end: Frame kết thúc.
+    """
+    code = """
+s = C.scene
+s.frame_start = %s
+s.frame_end = %s
+print(str(s.frame_start) + "-" + str(s.frame_end))
+""" % (start, end)
+    return execute(code)["output"].strip()
+
+
+@mcp.tool()
+def render_animation(
+    filepath: str,
+    start: int | None = None,
+    end: int | None = None,
+) -> str:
+    """Render toàn bộ animation ra chuỗi ảnh (pattern chứa # để Blender thay bằng số frame).
+
+    Args:
+        filepath: Pattern đường dẫn, vd "C:/render/frame_####.png".
+        start: Frame bắt đầu (bỏ trống = frame_start của scene).
+        end: Frame kết thúc (bỏ trống = frame_end của scene).
+    """
+    code = """
+s = C.scene
+if %s is not None:
+    s.frame_start = %s
+if %s is not None:
+    s.frame_end = %s
+s.render.filepath = %s
+bpy.ops.render.render(animation=True, write_still=True)
+print(s.render.filepath)
+""" % (_py(start), _py(start), _py(end), _py(end), _js(_to_blender_path(filepath)))
+    resp = execute(code, timeout=3600)
+    return resp["output"].strip()
+
+
+@mcp.tool()
+def extrude(object_name: str, distance: float = 1.0, axis: str = "Z") -> str:
+    """Extrude toàn bộ mesh (tất cả face) theo một trục.
+
+    Args:
+        object_name: Tên mesh.
+        distance: Khoảng cách extrude (có thể âm).
+        axis: Trục X, Y hoặc Z.
+    """
+    code = """
+import bmesh as _bm
+o = D.objects[%s]
+if o.type != "MESH":
+    raise ValueError("Object phai la mesh")
+me = o.data
+bm = _bm.new()
+bm.from_mesh(me)
+bm.faces.ensure_lookup_table()
+geom = _bm.ops.extrude_face_region(bm, geom=list(bm.faces))
+verts = [g for g in geom["geom"] if isinstance(g, _bm.types.BMVert)]
+ax = %s.upper()
+if ax not in ("X", "Y", "Z"):
+    raise ValueError("axis phai la X, Y hoac Z")
+idx = {"X": 0, "Y": 1, "Z": 2}[ax]
+vec = [0.0, 0.0, 0.0]
+vec[idx] = %s
+_bm.ops.translate(bm, vec=tuple(vec), verts=verts)
+bm.to_mesh(me)
+bm.free()
+me.update()
+o.update_tag()
+C.view_layer.update()
+print("extruded " + ax)
+""" % (_js(object_name), _js(axis), distance)
+    execute(code)
+    return f"Đã extrude '{object_name}' {distance} theo trục {axis.upper()}"
+
+
 def _ph_api(url: str) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": "maket-blender/1.1"})
+    req = urllib.request.Request(url, headers={"User-Agent": "maket-blender/1.2"})
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -1157,10 +1383,23 @@ def _polyhaven_files(asset_id: str, asset_type: str, resolution: str) -> dict:
         if asset_type == "hdris":
             return {"main": files["hdri"][resolution]["hdr"]["url"], "files": {}}
         if asset_type == "textures":
-            return {"main": files["Diffuse"][resolution]["jpg"]["url"], "files": {}}
+            maps = files.get("Diffuse") or {}
+            if not maps:
+                for key, value in files.items():
+                    if key not in ("gltf", "hdri", "blend") and isinstance(value, dict):
+                        maps = value
+                        break
+            res_map = maps.get(resolution) or {}
+            if res_map:
+                for fmt in ("jpg", "png", "exr"):
+                    if fmt in res_map and res_map[fmt].get("url"):
+                        return {"main": res_map[fmt]["url"], "files": {}}
+            raise ValueError("Texture này không có map color nào ở resolution này (chỉ có normal/roughness...), chưa hỗ trợ")
         if asset_type == "models":
             g = files["gltf"][resolution]["gltf"]
             return {"main": g["url"], "files": {k: v["url"] for k, v in g.get("include", {}).items()}}
+    except ValueError:
+        raise
     except Exception:
         pass
     if asset_type == "hdris":
@@ -1204,13 +1443,15 @@ base = _os.path.join(_tmp.gettempdir(), "maket_" + %s)
 _os.makedirs(base, exist_ok=True)
 for rel, u in manifest["files"].items():
     dst = _os.path.join(base, rel.replace("/", _os.sep))
-    _os.makedirs(_os.path.dirname(dst), exist_ok=True)
-    _ur.urlretrieve(u, dst)
+    if not _os.path.exists(dst):
+        _os.makedirs(_os.path.dirname(dst), exist_ok=True)
+        _ur.urlretrieve(u, dst)
 ext = manifest["main"].rsplit(".", 1)[-1].lower().split("?")[0]
 if ext not in ("hdr", "exr", "jpg", "png", "gltf", "glb"):
     ext = "bin"
 main_file = _os.path.join(base, %s + "." + ext)
-_ur.urlretrieve(manifest["main"], main_file)
+if not _os.path.exists(main_file):
+    _ur.urlretrieve(manifest["main"], main_file)
 result = {"asset_id": %s, "type": %s, "file": main_file}
 if %s == "hdris":
     world = C.scene.world
@@ -1275,6 +1516,24 @@ print(json.dumps(result))
         _js(asset_type),
     )
     return json.loads(execute(code, timeout=600)["output"])
+
+
+@mcp.resource("blender://scene")
+def resource_scene() -> dict:
+    """Thông tin scene hiện tại (objects, materials, camera, engine...)."""
+    return get_scene_info()
+
+
+@mcp.resource("blender://objects")
+def resource_objects() -> list:
+    """Danh sách object trong scene."""
+    return get_scene_info().get("objects", [])
+
+
+@mcp.resource("blender://objects/{name}")
+def resource_object(name: str) -> dict:
+    """Thông tin chi tiết một object theo tên."""
+    return get_object_info(name)
 
 
 def main():
