@@ -1,50 +1,50 @@
 # Blender MCP (maket-blender)
 
-MCP server điều khiển Blender qua TCP socket. Gồm 2 phần:
+An MCP server that controls Blender over a TCP socket. It consists of two parts:
 
-- **`addon.py`** — Addon Blender: chạy TCP server bên trong Blender, thực thi code bpy trên main thread
-- **`server.py`** — MCP server (stdio): 24 tool để tạo, chỉnh sửa, render và import/export scene
+- **`addon.py`** — A Blender addon that runs a TCP server inside Blender and executes bpy code on the main thread
+- **`server.py`** — An MCP server (stdio) with 24 tools to create, edit, render, and import/export scenes
 
 ```
-MCP client (stdio) ──> server.py ──(TCP 127.0.0.1:9877)──> addon trong Blender ──> bpy
+MCP client (stdio) ──> server.py ──(TCP 127.0.0.1:9877)──> addon inside Blender ──> bpy
 ```
 
-## Yêu cầu
+## Requirements
 
-- Blender 4.2+ (đã test với 5.2 LTS)
-- Python 3.10+ chạy MCP server (có thể dùng Python đi kèm Blender nếu máy không có Python riêng)
+- Blender 4.2+ (tested with 5.2 LTS)
+- Python 3.10+ to run the MCP server (you can use the Python bundled with Blender if you don't have a standalone Python)
 
-## Hướng dẫn cài đặt
+## Installation
 
-### 1. Cài addon vào Blender
+### 1. Install the addon in Blender
 
-**Cách A (khuyên dùng):**
-1. Mở Blender > `Edit` > `Preferences` > `Add-ons`
-2. Nhấn `Install...` (nút mũi tên xuống góc phải trên) và chọn file `addon.py`
-3. Tìm "Blender MCP Server" trong danh sách và bật checkbox
+**Option A (recommended):**
+1. Open Blender > `Edit` > `Preferences` > `Add-ons`
+2. Click `Install...` (arrow-down button in the top-right corner) and select `addon.py`
+3. Search for "Blender MCP Server" in the list and enable its checkbox
 
-**Cách B:** chép `addon.py` vào thư mục addons của Blender, ví dụ:
+**Option B:** copy `addon.py` into Blender's addons folder, e.g.:
 `C:\Program Files\Blender Foundation\Blender 5.2\5.2\scripts\addons\`
 
-### 2. Bật server trong Blender
+### 2. Start the server in Blender
 
-Mở sidebar (phím `N` trong 3D Viewport) > tab **MCP** > nhấn **Start MCP Server**.
+Open the sidebar (press `N` in the 3D Viewport) > **MCP** tab > click **Start MCP Server**.
 
-Server lắng nghe tại `127.0.0.1:9877`. Cổng mặc định khác với blender-mcp gốc (9876) để không xung đột nếu bạn cài cả hai.
+The server listens on `127.0.0.1:9877`. The default port differs from the original blender-mcp (9876) so you can have both installed without conflicts.
 
-### 3. Cài dependency cho MCP server
+### 3. Install the MCP server dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Nếu máy không có Python riêng, dùng Python đi kèm Blender:
+If you don't have a standalone Python, use the Python bundled with Blender:
 
 ```powershell
 & "C:\Program Files\Blender Foundation\Blender 5.2\5.2\python\bin\python.exe" -m pip install -r requirements.txt
 ```
 
-### 4. Đăng ký MCP với client
+### 4. Register the MCP server with your client
 
 **opencode** (`opencode.json`):
 
@@ -53,7 +53,7 @@ Nếu máy không có Python riêng, dùng Python đi kèm Blender:
   "mcp": {
     "maket-blender": {
       "type": "local",
-      "command": ["python", "C:/duong/dan/den/blender-mcp/server.py"],
+      "command": ["python", "C:/path/to/blender-mcp/server.py"],
       "enabled": true
     }
   }
@@ -67,56 +67,56 @@ Nếu máy không có Python riêng, dùng Python đi kèm Blender:
   "mcpServers": {
     "maket-blender": {
       "command": "python",
-      "args": ["C:/duong/dan/den/blender-mcp/server.py"]
+      "args": ["C:/path/to/blender-mcp/server.py"]
     }
   }
 }
 ```
 
-**Cursor / MCP client khác:** dùng lệnh `python C:/duong/dan/den/blender-mcp/server.py` với transport `stdio`.
+**Cursor / other MCP clients:** use the command `python C:/path/to/blender-mcp/server.py` with the `stdio` transport.
 
-### Biến môi trường (tùy chọn)
+### Environment variables (optional)
 
-| Biến | Mặc định | Mô tả |
+| Variable | Default | Description |
 |---|---|---|
-| `BLENDER_MCP_HOST` | `127.0.0.1` | Host của addon (phía server.py) |
-| `BLENDER_MCP_PORT` | `9877` | Cổng kết nối (phía server.py) |
-| `BLENDER_MCP_ADDON_PORT` | `9877` | Cổng lắng nghe (phía addon, đặt trước khi mở Blender) |
+| `BLENDER_MCP_HOST` | `127.0.0.1` | Host of the addon (server.py side) |
+| `BLENDER_MCP_PORT` | `9877` | Connection port (server.py side) |
+| `BLENDER_MCP_ADDON_PORT` | `9877` | Listening port (addon side, set before launching Blender) |
 
-## Chạy Blender headless (không giao diện)
+## Running Blender headless (no UI)
 
 ```bash
 blender -b --python headless_runner.py
 ```
 
-Blender sẽ chạy nền và xử lý lệnh từ MCP server bình thường.
+Blender will run in the background and process commands from the MCP server as usual.
 
-## Danh sách tool (24)
+## Tools (24)
 
-| Nhóm | Tool |
+| Group | Tools |
 |---|---|
-| Kết nối / tự do | `ping`, `execute_blender_code` |
-| Thông tin scene | `get_scene_info`, `get_object_info` |
-| Tạo / xóa | `create_primitive`, `delete_object`, `clear_scene` |
+| Connection / free-form | `ping`, `execute_blender_code` |
+| Scene info | `get_scene_info`, `get_object_info` |
+| Create / delete | `create_primitive`, `delete_object`, `clear_scene` |
 | Transform | `set_transform`, `duplicate_object`, `rename_object` |
-| Camera / đèn | `add_camera`, `set_active_camera`, `add_light` |
-| Modifier | `add_modifier`, `apply_modifiers` |
-| Vật liệu | `set_material_color`, `set_image_texture`, `set_emission` |
+| Camera / lights | `add_camera`, `set_active_camera`, `add_light` |
+| Modifiers | `add_modifier`, `apply_modifiers` |
+| Materials | `set_material_color`, `set_image_texture`, `set_emission` |
 | Mesh | `join_objects` |
-| Import / Export | `import_model`, `export_model` |
-| Render / lưu | `render_image`, `get_viewport_screenshot`, `save_blend` |
+| Import / export | `import_model`, `export_model` |
+| Render / save | `render_image`, `get_viewport_screenshot`, `save_blend` |
 
-## Kiểm tra
+## Testing
 
-Bật addon + Start server trong Blender (hoặc chạy headless), sau đó:
+Enable the addon and start the server in Blender (or run it headless), then:
 
 ```bash
-python test_client.py      # test 9 tool cơ bản qua socket
-python test_new_tools.py   # test 15 tool nâng cao
-python test_stdio.py       # test giao thức MCP stdio chuẩn
+python test_client.py      # tests the 9 basic tools over the socket
+python test_new_tools.py   # tests the 15 advanced tools
+python test_stdio.py       # tests the standard MCP stdio protocol
 ```
 
-## Ghi chú
+## Notes
 
-- Tool `execute_blender_code` cho phép chạy code Python tùy ý trong Blender với các biến có sẵn: `bpy`, `C` (= `bpy.context`), `D` (= `bpy.data`)
-- Mọi lệnh đều được thực thi trên main thread của Blender nên an toàn với bpy
+- The `execute_blender_code` tool lets you run arbitrary Python code inside Blender with these variables available: `bpy`, `C` (= `bpy.context`), `D` (= `bpy.data`)
+- All commands are executed on Blender's main thread, so they are safe to use with bpy
