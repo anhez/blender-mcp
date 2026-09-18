@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maket-blender"
+version = "1.1.0"
+description = "MCP server that controls Blender over TCP (maket-blender)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.5.0,<2"]
+
+[project.scripts]
+maket-blender = "server:main"
+
+[tool.setuptools]
+py-modules = ["server"]

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender MCP Server",
     "author": "Blender MCP",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > MCP",
     "description": "TCP server cho phép MCP client điều khiển Blender",
@@ -21,6 +21,7 @@ import traceback
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("BLENDER_MCP_ADDON_PORT", "9877"))
+AUTOSTART = os.environ.get("BLENDER_MCP_AUTOSTART", "0") == "1"
 
 
 class BlenderMCPServer:
@@ -213,6 +214,14 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_start)
     bpy.utils.register_class(BLENDERMCP_OT_stop)
     bpy.utils.register_class(BLENDERMCP_PT_panel)
+    if AUTOSTART:
+        try:
+            if not bpy.app.background and bpy.context.window_manager.windows:
+                bpy.ops.wm.blender_mcp_start()
+            else:
+                _server.start()
+        except Exception:
+            _server.start()
 
 
 def unregister():

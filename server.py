@@ -8,6 +8,8 @@ Chạy: python server.py
 import json
 import os
 import socket
+import urllib.parse
+import urllib.request
 
 from mcp.server.fastmcp import FastMCP
 
@@ -17,20 +19,34 @@ PORT = int(os.environ.get("BLENDER_MCP_PORT", "9877"))
 mcp = FastMCP(
     "maket-blender",
     instructions="MCP server điều khiển Blender qua addon Blender MCP Server. "
-    "Mọi thao tác 3D đều thông qua các tool ở đây.",
+    "Mọi thao tác 3D đều thông qua các tool ở đây. "
+    "Hỗ trợ: tạo/chỉnh sửa object, vật liệu, camera, đèn, animation, world/HDRI, "
+    "modifier, import/export, render và tải asset từ PolyHaven.",
 )
 
 
 def send_command(cmd: dict, timeout: float = 60.0) -> dict:
-    with socket.create_connection((HOST, PORT), timeout=10.0) as sock:
-        sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
-        sock.settimeout(timeout)
-        buf = b""
-        while b"\n" not in buf:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
+    try:
+        with socket.create_connection((HOST, PORT), timeout=10.0) as sock:
+            sock.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+            sock.settimeout(timeout)
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+    except (ConnectionRefusedError, TimeoutError, socket.timeout, OSError) as e:
+        raise ConnectionError(
+            f"Không kết nối được Blender ({HOST}:{PORT}). "
+            "Hãy mở Blender, vào Sidebar (N) > tab MCP > Start MCP Server, "
+            f"hoặc chạy headless. Chi tiết: {e}"
+        ) from e
+    if not buf:
+        raise ConnectionError(
+            f"Blender đóng kết nối mà không phản hồi ({HOST}:{PORT}). "
+            "Có thể Blender đang bận hoặc addon bị lỗi."
+        )
     return json.loads(buf.decode("utf-8"))
 
 
@@ -543,13 +559,19 @@ print(json.dumps({"joined_into": obs[0].name, "count": len(obs)}))
 
 
 @mcp.tool()
-def set_image_texture(object_name: str, image_path: str, material_name: str = "") -> dict:
-    """Gán ảnh texture vào Base Color của material object (tạo material nếu chưa có).
+def set_image_texture(
+    object_name: str,
+    image_path: str,
+    material_name: str = "",
+    map_type: str = "base_color",
+) -> dict:
+    """Gán ảnh texture vào material của object (tạo material nếu chưa có).
 
     Args:
         object_name: Tên object.
         image_path: Đường dẫn file ảnh (png, jpg, hdr...).
         material_name: Tên material (mặc định <object>_mat).
+        map_type: Loại map: base_color, normal, roughness, metallic, emission.
     """
     code = """
 import json
@@ -565,18 +587,36 @@ else:
     o.data.materials.append(mat)
 mat.use_nodes = True
 nt = mat.node_tree
-tex = next((n for n in nt.nodes if n.type == "TEX_IMAGE"), None)
+map_type = %s
+tex = next((n for n in nt.nodes if n.type == "TEX_IMAGE" and n.image == img), None)
 if tex is None:
     tex = nt.nodes.new("ShaderNodeTexImage")
 tex.image = img
 bsdf = next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED")
-nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-print(json.dumps({"material": mat.name, "image": img.name}))
+if map_type == "normal":
+    tex.image.colorspace_settings.name = "Non-Color"
+    nmap = next((n for n in nt.nodes if n.type == "NORMAL_MAP"), None)
+    if nmap is None:
+        nmap = nt.nodes.new("ShaderNodeNormalMap")
+    nt.links.new(tex.outputs["Color"], nmap.inputs["Color"])
+    nt.links.new(nmap.outputs["Normal"], bsdf.inputs["Normal"])
+elif map_type == "roughness":
+    tex.image.colorspace_settings.name = "Non-Color"
+    nt.links.new(tex.outputs["Color"], bsdf.inputs["Roughness"])
+elif map_type == "metallic":
+    tex.image.colorspace_settings.name = "Non-Color"
+    nt.links.new(tex.outputs["Color"], bsdf.inputs["Metallic"])
+elif map_type == "emission":
+    nt.links.new(tex.outputs["Color"], bsdf.inputs["Emission Color"])
+else:
+    nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+print(json.dumps({"material": mat.name, "image": img.name, "map_type": map_type}))
 """ % (
         _js(object_name),
         _js(image_path),
         _js(material_name),
         bool(material_name),
+        _js(map_type),
     )
     return json.loads(execute(code)["output"])
 
@@ -748,5 +788,498 @@ print(s.render.filepath)
     return resp["output"].strip()
 
 
-if __name__ == "__main__":
+@mcp.tool()
+def camera_look_at(camera_name: str, target_name: str) -> str:
+    """Hướng camera nhìn về một object (dùng TRACK_TO constraint).
+
+    Args:
+        camera_name: Tên camera.
+        target_name: Tên object cần nhìn tới.
+    """
+    code = """
+o = D.objects[%s]
+t = D.objects[%s]
+if o.type != "CAMERA":
+    raise ValueError("Object phai la camera")
+con = o.constraints.get("MCP Look At")
+if con is None:
+    con = o.constraints.new("TRACK_TO")
+    con.name = "MCP Look At"
+con.target = t
+con.track_axis = "TRACK_NEGATIVE_Z"
+con.up_axis = "UP_Y"
+print("ok")
+""" % (_js(camera_name), _js(target_name))
+    execute(code)
+    return f"'{camera_name}' đang nhìn về '{target_name}'"
+
+
+@mcp.tool()
+def set_camera_fov(camera_name: str, fov_degrees: float = 50.0) -> str:
+    """Đặt góc nhìn (FOV dọc, độ) cho camera.
+
+    Args:
+        camera_name: Tên camera.
+        fov_degrees: Góc FOV theo độ (mặc định 50).
+    """
+    code = """
+import math as _m
+o = D.objects[%s]
+if o.type != "CAMERA":
+    raise ValueError("Object phai la camera")
+o.data.angle = _m.radians(%s)
+print(str(o.data.angle))
+""" % (_js(camera_name), fov_degrees)
+    execute(code)
+    return f"FOV của '{camera_name}' = {fov_degrees} độ"
+
+
+@mcp.tool()
+def set_world_hdri(image_path: str, strength: float = 1.0) -> str:
+    """Đặt ảnh HDRI làm môi trường (world) cho scene.
+
+    Args:
+        image_path: Đường dẫn file .hdr/.exr.
+        strength: Cường độ ánh sáng môi trường (mặc định 1.0).
+    """
+    code = """
+world = C.scene.world
+if world is None:
+    world = D.worlds.new("World MCP")
+    C.scene.world = world
+world.use_nodes = True
+nt = world.node_tree
+nt.nodes.clear()
+env = nt.nodes.new("ShaderNodeTexEnvironment")
+bg = nt.nodes.new("ShaderNodeBackground")
+out = nt.nodes.new("ShaderNodeOutputWorld")
+env.image = D.images.load(%s)
+bg.inputs["Strength"].default_value = %s
+nt.links.new(env.outputs["Color"], bg.inputs["Color"])
+nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
+print("ok")
+""" % (_js(image_path), strength)
+    execute(code)
+    return f"Đã đặt world HDRI '{image_path}'"
+
+
+@mcp.tool()
+def set_frame(frame: int) -> int:
+    """Chuyển scene tới frame chỉ định.
+
+    Args:
+        frame: Số frame.
+    """
+    code = """
+C.scene.frame_set(%s)
+print(C.scene.frame_current)
+""" % frame
+    return int(execute(code)["output"].strip())
+
+
+@mcp.tool()
+def insert_keyframe(
+    object_name: str,
+    property_path: str = "location",
+    value: list | None = None,
+    frame: int | None = None,
+) -> str:
+    """Chèn keyframe cho thuộc tính của object (animation).
+
+    Args:
+        object_name: Tên object.
+        property_path: Đường dẫn thuộc tính: location, rotation_euler, scale...
+        value: Giá trị tại frame này (list [x, y, z]); nếu bỏ qua dùng giá trị hiện tại.
+        frame: Frame chèn keyframe; nếu bỏ qua dùng frame hiện tại.
+    """
+    code = """
+o = D.objects[%s]
+if %s is not None:
+    C.scene.frame_set(%s)
+if %s is not None:
+    setattr(o, %s, %s)
+ok = o.keyframe_insert(data_path=%s, index=-1)
+print("keyframed " + str(ok) + " at frame " + str(C.scene.frame_current))
+""" % (
+        _js(object_name),
+        _py(frame),
+        _py(frame),
+        _py(value),
+        _js(property_path),
+        _py(list(value) if value else None),
+        _js(property_path),
+    )
+    return execute(code)["output"].strip()
+
+
+@mcp.tool()
+def set_parent(child_name: str, parent_name: str, keep_transform: bool = True) -> str:
+    """Gán object làm con của object khác.
+
+    Args:
+        child_name: Tên object con.
+        parent_name: Tên object cha.
+        keep_transform: Giữ nguyên vị trí hiện tại của con (mặc định True).
+    """
+    code = """
+c = D.objects[%s]
+p = D.objects[%s]
+mat = c.matrix_world.copy()
+c.parent = p
+if %s:
+    c.matrix_world = mat
+print("ok")
+""" % (_js(child_name), _js(parent_name), bool(keep_transform))
+    execute(code)
+    return f"'{child_name}' là con của '{parent_name}'"
+
+
+@mcp.tool()
+def create_collection(name: str) -> str:
+    """Tạo collection mới.
+
+    Args:
+        name: Tên collection.
+    """
+    code = """
+col = D.collections.new(%s)
+C.scene.collection.children.link(col)
+print(col.name)
+""" % _js(name)
+    return execute(code)["output"].strip()
+
+
+@mcp.tool()
+def move_to_collection(object_names: list, collection_name: str) -> str:
+    """Chuyển các object vào collection (tạo mới nếu chưa có).
+
+    Args:
+        object_names: Danh sách tên object.
+        collection_name: Tên collection đích.
+    """
+    code = """
+obs = [D.objects[n] for n in %s]
+col = D.collections.get(%s)
+if col is None:
+    col = D.collections.new(%s)
+    C.scene.collection.children.link(col)
+for o in obs:
+    for c2 in list(o.users_collection):
+        c2.objects.unlink(o)
+    col.objects.link(o)
+print(col.name)
+""" % (_js(list(object_names)), _js(collection_name), _js(collection_name))
+    return f"Moved to '{execute(code)['output'].strip()}'"
+
+
+@mcp.tool()
+def remove_modifier(object_name: str, modifier_name: str) -> str:
+    """Xóa modifier khỏi object.
+
+    Args:
+        object_name: Tên object.
+        modifier_name: Tên modifier cần xóa.
+    """
+    code = """
+o = D.objects[%s]
+m = o.modifiers.get(%s)
+if m is None:
+    raise ValueError("Khong tim thay modifier '" + %s + "'")
+o.modifiers.remove(m)
+print("removed")
+""" % (_js(object_name), _js(modifier_name), _js(modifier_name))
+    execute(code)
+    return f"Đã xóa modifier '{modifier_name}'"
+
+
+@mcp.tool()
+def shade_smooth(object_name: str, smooth: bool = True) -> str:
+    """Bật/tắt smooth shading cho mesh.
+
+    Args:
+        object_name: Tên object.
+        smooth: True = smooth shading, False = flat.
+    """
+    code = """
+o = D.objects[%s]
+if o.type != "MESH":
+    raise ValueError("Object phai la mesh")
+for p in o.data.polygons:
+    p.use_smooth = %s
+o.data.update()
+print("ok")
+""" % (_js(object_name), bool(smooth))
+    execute(code)
+    return f"shade_smooth={smooth} cho '{object_name}'"
+
+
+@mcp.tool()
+def set_origin(object_name: str, origin_type: str = "ORIGIN_GEOMETRY") -> str:
+    """Đặt origin (gốc tọa độ) của object.
+
+    Args:
+        object_name: Tên object.
+        origin_type: ORIGIN_GEOMETRY, ORIGIN_CURSOR, ORIGIN_CENTER_OF_MASS, ORIGIN_CENTER_OF_VOLUME.
+    """
+    code = """
+o = D.objects[%s]
+C.view_layer.objects.active = o
+bpy.ops.object.select_all(action="DESELECT")
+o.select_set(True)
+bpy.ops.object.origin_set(type=%s)
+print("ok")
+""" % (_js(object_name), _js(origin_type))
+    execute(code)
+    return f"Đã set origin '{origin_type}' cho '{object_name}'"
+
+
+@mcp.tool()
+def create_empty(
+    name: str = "Empty MCP",
+    location: list = (0.0, 0.0, 0.0),
+    display_type: str = "PLAIN_AXES",
+) -> dict:
+    """Tạo object Empty (thường dùng làm target cho camera_look_at).
+
+    Args:
+        name: Tên empty.
+        location: Vị trí [x, y, z].
+        display_type: PLAIN_AXES, ARROWS, SPHERE, CUBE, CIRCLE...
+    """
+    code = """
+import json
+ob = D.objects.new(%s, None)
+C.collection.objects.link(ob)
+ob.location = %s
+ob.empty_display_type = %s.upper()
+print(json.dumps({"name": ob.name, "location": list(ob.location)}))
+""" % (_js(name), _py(list(location)), _js(display_type))
+    return json.loads(execute(code)["output"])
+
+
+@mcp.tool()
+def create_text(
+    text: str,
+    name: str = "",
+    location: list = (0.0, 0.0, 0.0),
+    size: float = 1.0,
+    extrude: float = 0.0,
+) -> dict:
+    """Tạo object chữ (Text/Font).
+
+    Args:
+        text: Nội dung chữ.
+        name: Tên object (mặc định Text MCP).
+        location: Vị trí [x, y, z].
+        size: Cỡ chữ.
+        extrude: Độ dày 3D (0 = phẳng).
+    """
+    code = """
+import json
+f = D.curves.new(%s if %s else "Text MCP", "FONT")
+f.body = %s
+f.size = %s
+f.extrude = %s
+ob = D.objects.new(f.name, f)
+C.collection.objects.link(ob)
+ob.location = %s
+print(json.dumps({"name": ob.name, "location": list(ob.location)}))
+""" % (
+        _js(name),
+        bool(name),
+        _js(text),
+        size,
+        extrude,
+        _py(list(location)),
+    )
+    return json.loads(execute(code)["output"])
+
+
+@mcp.tool()
+def assign_material(object_name: str, material_name: str) -> str:
+    """Gán material có sẵn (hoặc tạo mới) cho object.
+
+    Args:
+        object_name: Tên object.
+        material_name: Tên material; nếu chưa tồn tại sẽ tạo material Principled BSDF mới.
+    """
+    code = """
+o = D.objects[%s]
+mat = D.materials.get(%s)
+if mat is None:
+    mat = D.materials.new(%s)
+if o.data.materials:
+    o.data.materials[0] = mat
+else:
+    o.data.materials.append(mat)
+print(mat.name)
+""" % (_js(object_name), _js(material_name), _js(material_name))
+    return f"Đã gán material '{execute(code)['output'].strip()}'"
+
+
+def _ph_api(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "maket-blender/1.1"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+@mcp.tool()
+def search_polyhaven_assets(asset_type: str = "all", categories: str = "", limit: int = 20) -> list:
+    """Tìm asset miễn phí trên PolyHaven.
+
+    Args:
+        asset_type: hdris, textures, models hoặc all.
+        categories: Lọc theo danh mục (vd: "outdoor, skys"), bỏ trống = không lọc.
+        limit: Số kết quả tối đa.
+    """
+    q = {"type": asset_type}
+    if categories:
+        q["categories"] = categories
+    data = _ph_api("https://api.polyhaven.com/assets?" + urllib.parse.urlencode(q))
+    out = []
+    for aid, info in list(data.items())[:limit]:
+        out.append(
+            {
+                "id": aid,
+                "name": info.get("name"),
+                "type": info.get("type"),
+                "categories": info.get("categories", []),
+                "description": (info.get("description") or "")[:200],
+            }
+        )
+    return out
+
+
+def _polyhaven_files(asset_id: str, asset_type: str, resolution: str) -> dict:
+    """Trả về manifest: {'main': url, 'files': {relpath: url}}."""
+    try:
+        files = _ph_api(f"https://api.polyhaven.com/files/{asset_id}")
+        if asset_type == "hdris":
+            return {"main": files["hdri"][resolution]["hdr"]["url"], "files": {}}
+        if asset_type == "textures":
+            return {"main": files["Diffuse"][resolution]["jpg"]["url"], "files": {}}
+        if asset_type == "models":
+            g = files["gltf"][resolution]["gltf"]
+            return {"main": g["url"], "files": {k: v["url"] for k, v in g.get("include", {}).items()}}
+    except Exception:
+        pass
+    if asset_type == "hdris":
+        return {
+            "main": f"https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/{resolution}/{asset_id}_{resolution}.hdr",
+            "files": {},
+        }
+    if asset_type == "textures":
+        return {
+            "main": f"https://dl.polyhaven.org/file/ph-assets/Textures/jpg/{resolution}/{asset_id}/{asset_id}_diff_{resolution}.jpg",
+            "files": {},
+        }
+    raise ValueError("Không tìm được URL download cho model (thử lại files API)")
+
+
+@mcp.tool()
+def download_polyhaven_asset(
+    asset_id: str,
+    asset_type: str,
+    resolution: str = "1k",
+    object_name: str = "",
+    strength: float = 1.0,
+) -> dict:
+    """Tải asset PolyHaven về và áp thẳng vào scene (không cần API key).
+
+    Args:
+        asset_id: ID asset (lấy từ search_polyhaven_assets).
+        asset_type: hdris, textures hoặc models.
+        resolution: 1k, 2k, 4k...
+        object_name: Với textures: object được gán texture (bỏ trống = object đang active).
+        strength: Với hdris: cường độ môi trường.
+    """
+    manifest = _polyhaven_files(asset_id, asset_type, resolution)
+    code = """
+import json
+import os as _os
+import tempfile as _tmp
+import urllib.request as _ur
+manifest = %s
+base = _os.path.join(_tmp.gettempdir(), "maket_" + %s)
+_os.makedirs(base, exist_ok=True)
+for rel, u in manifest["files"].items():
+    dst = _os.path.join(base, rel.replace("/", _os.sep))
+    _os.makedirs(_os.path.dirname(dst), exist_ok=True)
+    _ur.urlretrieve(u, dst)
+ext = manifest["main"].rsplit(".", 1)[-1].lower().split("?")[0]
+if ext not in ("hdr", "exr", "jpg", "png", "gltf", "glb"):
+    ext = "bin"
+main_file = _os.path.join(base, %s + "." + ext)
+_ur.urlretrieve(manifest["main"], main_file)
+result = {"asset_id": %s, "type": %s, "file": main_file}
+if %s == "hdris":
+    world = C.scene.world
+    if world is None:
+        world = D.worlds.new("World " + %s)
+        C.scene.world = world
+    world.use_nodes = True
+    nt = world.node_tree
+    nt.nodes.clear()
+    env = nt.nodes.new("ShaderNodeTexEnvironment")
+    bg = nt.nodes.new("ShaderNodeBackground")
+    out = nt.nodes.new("ShaderNodeOutputWorld")
+    env.image = D.images.load(main_file)
+    bg.inputs["Strength"].default_value = %s
+    nt.links.new(env.outputs["Color"], bg.inputs["Color"])
+    nt.links.new(bg.outputs["Background"], out.inputs["Surface"])
+elif %s == "textures":
+    o = D.objects[%s] if %s else C.object
+    if o is None:
+        raise ValueError("Khong co object de gan texture")
+    img = D.images.load(main_file)
+    mat_name = o.name + "_polyhaven"
+    mat = D.materials.get(mat_name)
+    if mat is None:
+        mat = D.materials.new(mat_name)
+    if o.data.materials:
+        o.data.materials[0] = mat
+    else:
+        o.data.materials.append(mat)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    tex = nt.nodes.new("ShaderNodeTexImage")
+    tex.image = img
+    bsdf = next(n for n in nt.nodes if n.type == "BSDF_PRINCIPLED")
+    nt.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+    result["object"] = o.name
+elif %s == "models":
+    import sys as _sys
+    import io as _io
+    _outer = _sys.stdout
+    _sys.stdout = _io.StringIO()
+    try:
+        before = set(D.objects)
+        bpy.ops.import_scene.gltf(filepath=main_file)
+        result["imported"] = [o.name for o in D.objects if o.name not in before]
+    finally:
+        result["import_log"] = _sys.stdout.getvalue().strip()
+        _sys.stdout = _outer
+print(json.dumps(result))
+""" % (
+        _js(manifest),
+        _js(asset_id),
+        _js(asset_id),
+        _js(asset_id),
+        _js(asset_type),
+        _js(asset_type),
+        _js(asset_id),
+        strength,
+        _js(asset_type),
+        _js(object_name),
+        bool(object_name),
+        _js(asset_type),
+    )
+    return json.loads(execute(code, timeout=600)["output"])
+
+
+def main():
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

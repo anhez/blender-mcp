@@ -2,3 +2,15 @@ __pycache__/
 *.pyc
 *.log
 *.pid
+.venv/
+venv/
+*.blend
+*.blend1
+*.png
+*.jpg
+*.hdr
+*.exr
+*.egg-info/
+build/
+dist/
+downloads/
